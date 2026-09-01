@@ -1,0 +1,337 @@
+"""The tile pyramid: one sheet at one resolution per zoom, and renamed into place whole.
+
+Every base layer this project draws is cut into ``{z}/{x}_{y}.png``, one level per zoom, so
+the page fetches the pixels it can show rather than a 16384 px sheet. Level ``z`` holds
+``2**z`` tiles a side and is **one Lanczos downscale of the whole sheet**, never of the level
+above it, so no level accumulates the softening of six successive halvings; the levels below
+the top add a third again to the top's own bytes. A pyramid is only ever renamed into place,
+so a reader meets a whole tree or no tree. Pillow and the sheet are parameters, as everywhere
+in this package, so the suite drives the cutting with a stand-in.
+
+``tiles@2x/`` is the identical GRID at twice the pixels -- same squares of the world, 512 px
+a tile -- which is what a hi-DPI display wants from the same ``{z}/{x}/{y}`` request. A 512 px
+tile eats a level of depth, so an @2x tree is always exactly one level shallower than the 1x
+tree cut from the same sheet.
+
+Above one worker, the per-tile PNG encode is spread over processes and **the resampling stays
+serial in the parent**: the level's pixels are published once into a ``shared_memory`` block
+and each task crops one row of tiles out of it. Because no worker resamples, none can disagree
+about a filter tap at a strip boundary, which is what makes the parallel path byte-identical
+rather than merely equivalent -- ``tools/gen_map_renders.py --check-parallel`` compares the
+SHA-256 of every tile from both.
+"""
+
+from __future__ import annotations
+
+import shutil
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+
+from .provenance import RETIRED_SUFFIX, STAGING_SUFFIX
+
+#: The directory a pyramid lives in, and the square a browser fetches. Deliberately not
+#: called ``TILE_PX``: to ``tools/gen_map_image.py`` a "tile" is one of the four 4096 px
+#: slices the game ships, and the two meanings must not collide in a file that holds both.
+TILES_DIR_NAME = "tiles"
+PYRAMID_TILE_PX = 256
+
+#: A separate directory rather than a filename suffix, because it is a whole tree with its
+#: own depth and the endpoint picks between the two the way it picks between layers.
+TILES_2X_DIR_NAME = "tiles@2x"
+PYRAMID_TILE_2X_PX = PYRAMID_TILE_PX * 2
+
+#: The staging and retirement names, off the suffixes ``provenance`` already spells.
+TILES_STAGING = TILES_DIR_NAME + STAGING_SUFFIX
+TILES_RETIRED = TILES_DIR_NAME + RETIRED_SUFFIX
+
+#: A level with fewer tiles than this is cut serially however many workers were asked for:
+#: publishing a shared block and waking a pool to write four PNGs costs more than writing them.
+PARALLEL_MIN_TILES = 16
+
+#: What a level says it was cut from when the caller does not say. Every caller that is not
+#: cutting the game's artwork passes its own, so a level record cannot name the artwork under
+#: a hillshade.
+DEFAULT_LEVEL_SOURCE = "the game's own 8192 px artwork, Lanczos"
+
+#: How much an upscaled top level multiplies the sheet by when the caller does not say.
+DEFAULT_UPSCALE = 4
+
+
+class PyramidError(Exception):
+    """A pyramid cannot be cut, or must not be installed."""
+
+
+def pyramid_top_z(sheet_px: int, tile_px: int = PYRAMID_TILE_PX) -> int:
+    """The deepest level of a pyramid over a ``sheet_px`` square: 8192 -> 5. Derived rather
+    than typed in, because ``--size`` can halve the sheet and a pyramid one level too deep is
+    a level of tiles upscaled from nothing."""
+    levels = sheet_px // tile_px
+    if levels < 1 or levels & (levels - 1):
+        raise PyramidError(
+            f"a {sheet_px} px sheet is not a power-of-two multiple of {tile_px} px tiles, "
+            "so no pyramid divides it evenly"
+        )
+    return levels.bit_length() - 1
+
+
+def enhanced_top_z(
+    sheet_px: int, scale: int = DEFAULT_UPSCALE, tile_px: int = PYRAMID_TILE_PX
+) -> int:
+    """The deepest level once the sheet has been upscaled ``scale`` times: 8192, 4x -> 7. An
+    upscale is worth exactly log2(scale) levels, and one that is not a power of two would not
+    divide the tile grid at all."""
+    if scale < 1 or scale & (scale - 1):
+        raise PyramidError(f"an upscale of {scale}x is not a power of two, so it adds no levels")
+    return pyramid_top_z(sheet_px, tile_px) + (scale.bit_length() - 1)
+
+
+def tile_relpath(z: int, x: int, y: int) -> str:
+    """``{z}/{x}_{y}.png`` -- the one place the layout is written down.
+
+    The web API has the same function, and a test asserts the two agree: the tool that
+    writes the tree and the endpoint that serves it must not hold two opinions about
+    where a tile lives.
+    """
+    return f"{z}/{x}_{y}.png"
+
+
+def cut_square(piece, dest: Path, z: int, ox: int, oy: int, tile_px: int) -> int:
+    """Slice one square image into ``dest/{z}/{x}_{y}.png``, starting at tile ``(ox, oy)``.
+
+    Returns the bytes written, which the caller sums into the level record a reader checks the
+    tree against. ``width`` is asked for twice rather than ``height`` once so that a test's
+    stand-in sheet need only carry the attributes really used.
+    """
+    (dest / str(z)).mkdir(parents=True, exist_ok=True)
+    written = 0
+    for y in range(piece.width // tile_px):
+        for x in range(piece.width // tile_px):
+            box = (x * tile_px, y * tile_px, (x + 1) * tile_px, (y + 1) * tile_px)
+            path = dest / tile_relpath(z, ox + x, oy + y)
+            piece.crop(box).save(path, format="PNG", optimize=True)
+            written += path.stat().st_size
+    return written
+
+
+def _encode_tile_row(job: tuple[str, str, int, int, int, int, str, int]) -> int:
+    """One row of tiles, cropped out of a shared block and deflated. Runs in a child.
+
+    Top level and argument-shaped rather than a closure because Windows spawns its workers:
+    everything a task needs must pickle, and the pixels travel as a ``shared_memory`` NAME.
+    Pillow is imported inside the function, the rule everywhere in this package, so a machine
+    without the ``gen`` extra still imports the module.
+    """
+    from multiprocessing.shared_memory import SharedMemory
+
+    from PIL import Image
+
+    name, mode, width, stride, z, row, dest, tile_px = job
+    block = SharedMemory(name=name)
+    try:
+        start, length = row * tile_px * stride, tile_px * stride
+        strip = Image.frombytes(mode, (width, tile_px), bytes(block.buf[start : start + length]))
+        written = 0
+        for x in range(width // tile_px):
+            path = Path(dest) / tile_relpath(z, x, row)
+            box = (x * tile_px, 0, (x + 1) * tile_px, tile_px)
+            strip.crop(box).save(path, format="PNG", optimize=True)
+            written += path.stat().st_size
+        return written
+    finally:
+        block.close()
+
+
+def cut_square_parallel(piece, dest: Path, z: int, tile_px: int, pool) -> int:
+    """``cut_square`` at ``(0, 0)`` with the deflating spread over a process pool.
+
+    Nothing here resamples, filters or moves a coordinate: the level arrives already resized
+    and a worker only decides where one rectangle of it starts. ``cut_square``'s offset
+    arguments are absent because the only caller that cuts at an offset is the enhancement
+    stage, which is GPU-bound rather than deflate-bound.
+    """
+    from multiprocessing.shared_memory import SharedMemory
+
+    (dest / str(z)).mkdir(parents=True, exist_ok=True)
+    raw = piece.tobytes()
+    stride = len(raw) // piece.width
+    block = SharedMemory(create=True, size=len(raw))
+    try:
+        block.buf[: len(raw)] = raw
+        del raw
+        jobs = [
+            (block.name, piece.mode, piece.width, stride, z, row, str(dest), tile_px)
+            for row in range(piece.width // tile_px)
+        ]
+        return sum(pool.map(_encode_tile_row, jobs, chunksize=1))
+    finally:
+        block.close()
+        block.unlink()
+
+
+def cut_pyramid(
+    sheet,
+    image_mod,
+    dest: Path,
+    tile_px: int = PYRAMID_TILE_PX,
+    source: str = DEFAULT_LEVEL_SOURCE,
+    workers: int = 1,
+    dir_name: str = TILES_DIR_NAME,
+) -> dict:
+    """Cut ``sheet`` into ``dest/{z}/{x}_{y}.png`` for every level, and say what it wrote.
+
+    ``--enhance`` adds levels ABOVE this top out of upscaled pixels and does not touch these:
+    a level with real pixels behind it has no business being drawn from invented ones.
+    ``workers`` above one spreads the per-tile PNG encode over that many processes; one is the
+    default because the suite drives this with a stand-in sheet that is not an image.
+    """
+    top = pyramid_top_z(sheet.width, tile_px)
+    levels = []
+    pool = ProcessPoolExecutor(max_workers=workers) if workers > 1 else None
+    try:
+        for z in range(top + 1):
+            side = tile_px << z
+            level = sheet if side == sheet.width else sheet.resize((side, side), image_mod.LANCZOS)
+            tiles = (1 << z) ** 2
+            if pool is not None and tiles >= PARALLEL_MIN_TILES:
+                written = cut_square_parallel(level, dest, z, tile_px, pool)
+            else:
+                written = cut_square(level, dest, z, 0, 0, tile_px)
+            levels.append(
+                {
+                    "z": z,
+                    "sheet_px": side,
+                    "tiles": tiles,
+                    "bytes": written,
+                    "from": source,
+                }
+            )
+            print(f"  pyramid z{z}: {side}x{side}, {tiles} tiles, {written / 1e6:.2f} MB")
+    finally:
+        if pool is not None:
+            pool.shutdown()
+    return {
+        "layout": f"{dir_name}/{{z}}/{{x}}_{{y}}.png",
+        "tile_px": tile_px,
+        "max_z": top,
+        "enhanced": False,
+        "count": sum(level["tiles"] for level in levels),
+        "bytes": sum(level["bytes"] for level in levels),
+        "levels": levels,
+        "workers": workers,
+        "role": (
+            "the same sheet at one resolution per zoom, so the page fetches the pixels it "
+            "can actually show. map.png is still written beside it: it is what a page "
+            "falls back to when there is no pyramid, and the one file a reader can open."
+        ),
+        "completeness": (
+            "written to " + dir_name + STAGING_SUFFIX + " and renamed into place, so this "
+            "directory is either a whole pyramid or absent -- an interrupted run cannot "
+            "leave a partial one for a reader to trust. count is what a doubter can check "
+            "it against."
+        ),
+    }
+
+
+def merge_enhanced(stats: dict, extra: dict) -> dict:
+    """Fold the enhanced levels into the pyramid record the sidecar carries. ``count`` and
+    ``bytes`` are re-summed rather than added to, so the number ``install_pyramid`` checks the
+    tree against stays derived from the list a reader would count themselves."""
+    levels = stats["levels"] + extra["levels"]
+    return {
+        **stats,
+        "max_z": max(level["z"] for level in levels),
+        "enhanced": True,
+        "count": sum(level["tiles"] for level in levels),
+        "bytes": sum(level["bytes"] for level in levels),
+        "levels": levels,
+        "enhancement": extra["enhancement"],
+    }
+
+
+def install_pyramid(
+    sheet,
+    image_mod,
+    out_dir: Path,
+    tile_px: int = PYRAMID_TILE_PX,
+    enhance=None,
+    source: str = DEFAULT_LEVEL_SOURCE,
+    workers: int = 1,
+    dir_name: str = TILES_DIR_NAME,
+) -> dict:
+    """Cut the pyramid into staging, then rename it over any older one.
+
+    A previous tree is moved aside first (Windows will not rename onto a non-empty directory)
+    and deleted afterwards, and leftovers from a run that died mid-swap are cleared rather than
+    merged into. ``enhance`` runs INSIDE the staging window: the GPU stage is the part most
+    likely to fail, and a failure there must leave the installed pyramid untouched.
+    ``dir_name`` picks which tree of this layer is being installed -- ``tiles/`` or the @2x
+    grid -- and carries its own staging names, so cutting one cannot disturb the other.
+    """
+    staging = out_dir / (dir_name + STAGING_SUFFIX)
+    retired = out_dir / (dir_name + RETIRED_SUFFIX)
+    final = out_dir / dir_name
+    for stale in (staging, retired):
+        if stale.exists():
+            shutil.rmtree(stale)
+    staging.mkdir(parents=True)
+    stats = cut_pyramid(sheet, image_mod, staging, tile_px, source, workers, dir_name)
+    if enhance is not None:
+        stats = merge_enhanced(stats, enhance(staging))
+
+    on_disk = sum(1 for _ in staging.rglob("*.png"))
+    if on_disk != stats["count"]:
+        raise PyramidError(
+            f"the pyramid was cut with {stats['count']} tiles but {on_disk} PNGs are in "
+            f"{staging} -- refusing to install a tree that does not match its own count"
+        )
+    stats["installed_by"] = swap_into_place(staging, final, retired)
+    return stats
+
+
+def swap_into_place(staging: Path, final: Path, retired: Path) -> str:
+    """Put the finished tree where it is served from, and say how it managed it.
+
+    The whole tree at once is the intent and is tried first, so a reader meets the old pyramid
+    or the new one and never a mixture. **Windows will not rename a directory anything has
+    open** -- an Explorer window, the search indexer, a backup agent -- so the fallback swaps
+    one level at a time, each renamed atomically over its predecessor. A reader who catches
+    the middle of that sees every level present and some of them still the old cut, rather
+    than a level missing; levels only the old tree had are removed after, so a shallower new
+    pyramid leaves no deep level behind pretending to belong to it.
+
+    Which of the two happened is returned and recorded, because the weaker guarantee is worth
+    seeing from the outside.
+    """
+    if not final.exists():
+        staging.rename(final)
+        return "the whole tree renamed into place"
+    try:
+        final.rename(retired)
+    except OSError:
+        levels = sorted(child.name for child in staging.iterdir())
+        for name in levels:
+            target = final / name
+            if target.exists():
+                spent = final / (name + RETIRED_SUFFIX)
+                if spent.exists():
+                    shutil.rmtree(spent)
+                target.rename(spent)
+                (staging / name).rename(target)
+                shutil.rmtree(spent)
+            else:
+                (staging / name).rename(target)
+        for leftover in final.iterdir():
+            if leftover.name in levels:
+                continue
+            if leftover.is_dir():
+                shutil.rmtree(leftover)
+            else:
+                leftover.unlink()
+        shutil.rmtree(staging)
+        return (
+            "level by level: something has the served directory open, which on Windows "
+            "refuses a whole-tree rename"
+        )
+    staging.rename(final)
+    shutil.rmtree(retired)
+    return "the whole tree renamed into place"

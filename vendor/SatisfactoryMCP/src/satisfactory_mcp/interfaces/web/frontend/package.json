@@ -1,0 +1,21 @@
+{
+  "name": "satisfactory-mcp-web-frontend",
+  "private": true,
+  "type": "module",
+  "description": "The map page. Built into ../static/, which is what the Python package serves.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "check": "tsc --noEmit",
+    "typegen": "openapi-typescript http://127.0.0.1:8712/openapi.json -o src/api-schema.d.ts && node scripts/stamp-schema.mjs"
+  },
+  "dependencies": {
+    "leaflet": "1.9.4"
+  },
+  "devDependencies": {
+    "@types/leaflet": "1.9.20",
+    "openapi-typescript": "7.9.1",
+    "typescript": "5.9.3",
+    "vite": "7.3.6"
+  }
+}

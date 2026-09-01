@@ -1,0 +1,30 @@
+{
+  /* Everything on, and it got there in that order for a reason.
+     The port of the old 2,600-line script shipped with `strict` OFF, on purpose: turning it
+     on in the same commit as the move would have buried a behaviour regression under 400
+     implicit-any errors, and the point of that commit was that its diff was a move. Strict
+     came with the types, one commit later, and `noUncheckedIndexedAccess` one after that --
+     it cost five call sites, each of which was a real "this index can miss" that the old
+     code answered correctly by accident. See frontend/README.md. */
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["vite/client"],
+
+    /* Vite transpiles per file with esbuild and never type-checks, so nothing here emits:
+       `npm run check` is the only consumer, and it is a separate gate on purpose. */
+    "noEmit": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitAny": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
+  },
+  "include": ["src", "vite.config.ts", "node-fs.d.ts"]
+}

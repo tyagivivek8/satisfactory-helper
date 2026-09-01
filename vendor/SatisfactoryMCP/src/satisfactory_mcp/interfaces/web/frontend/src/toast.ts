@@ -1,0 +1,61 @@
+/* The message strip: what the page says when something failed, and the one thing it says
+ * when something went right without being asked. Two kinds of message, one mechanism, two
+ * lifetimes and two colours.
+ */
+
+import { el } from "./dom";
+
+/* Long enough to read when six endpoints fail at once, because failures stack into their own
+ * rows rather than overwriting each other. A click dismisses one, so the strip is never an
+ * undismissable patch of dead map. */
+var FAIL_MS = 12000;
+
+/* Shorter, because a note describes something the reader can already see on the map. Its
+ * colour differs from a failure's for the same reason: a note the eye reads as an error is
+ * worse than no note. */
+var NOTE_MS = 6000;
+
+export function toast(message: string, kind: "fail" | "note", ms: number): void {
+  var box = el("err");
+  var rows: Element[] = Array.prototype.slice.call(box.children);
+  rows.forEach(function (row) {
+    // The same message twice is one problem, not two rows.
+    if (row.textContent === message) row.remove();
+  });
+  var row = document.createElement("div");
+  row.className = "err-row " + kind;
+  row.textContent = message;
+  row.title = "click to dismiss";
+  row.onclick = function () {
+    row.remove();
+  };
+  box.appendChild(row);
+  setTimeout(function () {
+    row.remove();
+  }, ms);
+}
+
+export function fail(message: string): void {
+  toast(message, "fail", FAIL_MS);
+}
+
+export function note(message: string): void {
+  toast(message, "note", NOTE_MS);
+}
+
+/* Browser-internal error phrases, translated to what they mean HERE. "Failed to fetch"
+ * is Chrome for "the server you started is gone", and that is the actionable sentence. */
+export function friendly(error: unknown): string {
+  // Read structurally rather than with `instanceof Error`: a rejected fetch that arrives as a
+  // DOMException still carries a `message`, and asking about the constructor would start
+  // printing "[object DOMException]" instead.
+  var message = (error as { message?: unknown } | null | undefined)?.message;
+  var text = error && message ? String(message) : String(error);
+  if (/Failed to fetch|NetworkError|Load failed/i.test(text)) {
+    return "the server is not answering — is it still running?";
+  }
+  if (/Unexpected token|not valid JSON/i.test(text)) {
+    return "the server answered with something that is not JSON";
+  }
+  return text;
+}

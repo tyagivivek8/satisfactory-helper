@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+uv.lock
+
+# Agent worktrees: git repos of their own, never part of this one.
+.claude/worktrees/
+
+# The user's own files: a map render for the web map's base layer lives at
+# data/local/map.png (corners optionally in data/local/map.json). The app loads it if
+# it is there; the repository ships no map imagery and never will.
+data/local/
+
+# Build output. The web page is compiled by Vite from interfaces/web/frontend/ into
+# static/, Leaflet and all, and a dependency's compiled code does not belong in this
+# tree: run `npm ci && npm run build` there to produce it. tests/test_architecture.py
+# enforces that nothing under static/ is ever tracked again.
+src/satisfactory_mcp/interfaces/web/static/

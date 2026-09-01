@@ -1,0 +1,42 @@
+# Local brainstorming artifacts
+/docs/
+.superpowers/
+.impeccable/
+.worktrees/
+.playwright-cli/
+output/
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+
+# Satisfactory saves must never enter the repository
+*.sav
+
+# Python
+.venv/
+.bundle-venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
+
+# Node
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Local runtime data
+.local-data/
+*.sqlite
+*.sqlite3
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

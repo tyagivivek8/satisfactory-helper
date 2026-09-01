@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Satisfactory &mdash; world map</title>
+    <!--
+      Bundled, not CDN'd: this tool reads a local save directory and has no business needing
+      the internet to draw. Leaflet is compiled into the bundle, so every build carries its
+      BSD-2-Clause text -- vite.config.ts copies it. No game textures and no map tiles are
+      shipped or fetched.
+
+      Both stylesheets are imported by main.ts rather than linked here, and that is what pins
+      their ORDER: Leaflet's own rules first, this page's overrides second. Several of those
+      overrides match Leaflet's specificity exactly and win on source order alone -- see the
+      note above `.leaflet-control-layers .layer-folded` in style.css.
+    -->
+  </head>
+  <body>
+    <header id="bar">
+      <strong>Satisfactory</strong>
+      <select id="world" title="which world to read"></select>
+      <select id="save" title="which save of this world to read; 'newest save' follows the game as it writes"></select>
+      <span id="summary" class="muted">loading&hellip;</span>
+      <span id="live" class="dot" title="connecting to the save watcher&hellip;"></span>
+    </header>
+    <div id="map"></div>
+    <!-- The encodings no checkbox can explain, because they are inside a layer rather than
+         a layer of their own.
+
+         Hollow is the trap, so the shape is named in front of it every time. A hollow DOT is
+         a node with an extractor standing on it -- drawn away, because the thing on top of it
+         is the news. A hollow BOX is a container with nothing in it -- drawn away, because an
+         empty box is a place with room in it. Those are opposite claims about presence, and
+         the only thing telling them apart is dot versus box, so neither ever appears here
+         unqualified. (A paused machine is hollow too and is not a third meaning: it is the
+         dashed outline that says so, and the fade only follows it.)
+
+         Kept in step with four files by hand: PURITY_RADIUS in markers.ts, the fillOpacity lines in markers.ts and placements.ts, ROUTE_CHEVRONS in routes.ts, and POLE_RADIUS_PX / TOWER_CLASS in power.ts.
+
+         A details element and not a strip, so the map's bottom edge belongs to the map: the
+         closed state is a chip the size of its two words, and the open card grows upward off
+         the same bottom anchor. Native disclosure, no script -- this file stays static. -->
+    <details id="legend" title="how the markers encode what they know">
+      <summary>marker key</summary>
+      <div class="legend-rows">
+        <span class="legend-term">dot size</span><span>purity &mdash; impure &lt; normal &lt; pure</span>
+        <span class="legend-term">hollow dot</span><span>extractor on that node</span>
+        <span class="legend-term">hollow box</span><span>empty container</span>
+        <span class="legend-term">dashed box</span><span>paused machine</span>
+        <span class="legend-term">belt ring</span><span>conveyor lift</span>
+        <span class="legend-term">chevrons</span><span>which way the fluid goes</span>
+        <span class="legend-term">pole dot size</span><span>how many wires it carries</span>
+        <span class="legend-term">pole ring</span><span>power tower</span>
+      </div>
+    </details>
+    <div id="err"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
